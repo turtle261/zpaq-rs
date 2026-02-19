@@ -71,7 +71,6 @@ fn main() {
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
 
     // libzpaq JIT is x86_64-specific. Force NOJIT on non-x86_64 targets,
     // while still allowing explicit `--features nojit` on x86_64.
