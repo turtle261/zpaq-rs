@@ -9,6 +9,7 @@ homepage = "https://github.com/turtle261/zpaq-rs"
 documentation = "https://docs.rs/zpaq_rs"
 keywords = ["zpaq", "compression"]
 categories = ["compression"]
+authors = ["Noah Cashin <noahc959@icloud.com>"]
 build = "build.rs"
 
 [features]
