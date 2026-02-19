@@ -97,7 +97,7 @@ jobs:
             .ci-cache/musl/cargo
             .ci-cache/musl/rustup
             target/x86_64-unknown-linux-musl
-          key: ${{ runner.os }}-musl-alpine-3.23.3-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml') }}
+          key: ${{ runner.os }}-musl-alpine-3.23.3-${{ hashFiles('Cargo.lock', '.github/workflows/rust.yml', 'build.rs', 'zpaq_rs_ffi.cpp', 'zpaq/libzpaq.cpp', 'zpaq/libzpaq.h') }}
           restore-keys: |
             ${{ runner.os }}-musl-alpine-3.23.3-
 
@@ -131,19 +131,43 @@ jobs:
               export CXXFLAGS_x86_64_unknown_linux_musl="--gcc-toolchain=/usr -isystem ${cxx_base} -isystem ${cxx_base}/x86_64-alpine-linux-musl -isystem ${cxx_base}/backward"
               export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=clang
               export MUSL_LD_RUSTFLAGS="-C link-arg=-fuse-ld=lld"
+              export MUSL_RUSTDOCFLAGS="-C target-cpu=native -C link-arg=-fuse-ld=lld"
 
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --locked
               RUSTFLAGS="-D warnings ${MUSL_LD_RUSTFLAGS}" cargo check --target x86_64-unknown-linux-musl --locked --features nojit
 
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --locked
-              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --locked --features nojit
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --locked
+              RUSTFLAGS="${MUSL_LD_RUSTFLAGS}" RUSTDOCFLAGS="${MUSL_RUSTDOCFLAGS}" cargo test --release --target x86_64-unknown-linux-musl --locked --features nojit
             '
 
   # ── macOS ─────────────────────────────────────────────────────────────────
-  test-macos:
-    name: macOS
+  test-macos-intel:
+    name: macOS Intel x86_64
     needs: lint
-    runs-on: macos-latest
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test (default)
+        env:
+          RUSTDOCFLAGS: "-C target-cpu=native"
+        run: cargo test --release --locked
+
+      - name: Test (nojit)
+        env:
+          RUSTDOCFLAGS: "-C target-cpu=native"
+        run: cargo test --release --locked --features nojit
+
+  test-macos-arm64:
+    name: macOS arm64
+    needs: lint
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
 

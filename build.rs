@@ -69,7 +69,13 @@ fn main() {
     #[cfg(unix)]
     build.define("unix", None);
 
-    if env::var_os("CARGO_FEATURE_NOJIT").is_some() {
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    // libzpaq JIT is x86_64-specific. Force NOJIT on non-x86_64 targets,
+    // while still allowing explicit `--features nojit` on x86_64.
+    if env::var_os("CARGO_FEATURE_NOJIT").is_some() || target_arch != "x86_64" {
         build.define("NOJIT", None);
     }
 
@@ -86,8 +92,10 @@ fn main() {
     //   C++ objects, which can drop symbols from libzpaq_rs_ffi.a. Disable
     //   C++-side LTO there to preserve reliable linking.
     let profile = env::var("PROFILE").unwrap_or_default();
-    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
-    if (profile == "release" || profile == "bench") && !cfg!(windows) && target_os != "netbsd" {
+    if (profile == "release" || profile == "bench")
+        && target_os != "windows"
+        && target_os != "netbsd"
+    {
         build.flag_if_supported("-flto");
     }
 
