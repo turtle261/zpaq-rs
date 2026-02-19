@@ -1,0 +1,22 @@
+[package]
+name = "zpaq_rs"
+version = "1.0.0"
+edition = "2024"
+license = "CC0-1.0"
+build = "build.rs"
+
+[features]
+default = []
+nojit = []
+
+[lib]
+name = "zpaq_rs"
+crate-type = ["rlib"]
+
+[dependencies]
+
+[dev-dependencies]
+hex = "0.4"
+
+[build-dependencies]
+cc = "1"
