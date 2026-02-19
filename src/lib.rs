@@ -1,15 +1,62 @@
-//! Safe Rust bindings for libzpaq (compression, decompression, crypto utilities).
+//! Safe Rust bindings for [libzpaq](https://github.com/zpaq/zpaq) — the ZPAQ
+//! compression library by Matt Mahoney.
 //!
-//! The bindings are backed by a small C++ shim compiled in `build.rs`.
+//! This crate wraps a small C++ shim (`zpaq_rs_ffi.cpp`) that is compiled at
+//! build time via the `cc` crate.  No dynamic libraries are required at
+//! runtime; everything is statically linked.
 //!
-//! Notes on performance:
-//! - Rust LTO applies within Rust crates, and C++ LTO applies within the C++ objects.
-//! - Cross-language inlining (Rust <-> C++) is toolchain-dependent and not guaranteed.
-//! - Prefer `compress_size`/`compress_size_stream` when you only need sizes.
+//! # Compression method strings
 //!
-//! Use `compress_to_vec`
-//! / `decompress_to_vec` for simple use cases, or `compress_stream` /
-//! `decompress_stream` to work with any `Read`/`Write` streams.
+//! Most functions accept a `method` parameter that controls the ZPAQ
+//! compression algorithm and level.  Recognised values:
+//!
+//! | Value | Meaning |
+//! |-------|---------|
+//! | `"1"` | Fast (level 1) |
+//! | `"2"` | Balanced (level 2) |
+//! | `"3"` | Better (level 3) |
+//! | `"4"` | Maximum (level 4) |
+//! | `"5"` | Ultra (level 5) |
+//! | `"x4.3ci1"` | Example explicit method string |
+//!
+//! Higher numeric levels compress better but are slower and use more memory.
+//! Explicit method strings (starting with `x`, `s`, `i`, `0`–`9`) allow
+//! fine-grained control; see the [zpaq specification](http://mattmahoney.net/dc/zpaq206.pdf)
+//! for details.
+//!
+//! # Feature flags
+//!
+//! * **`nojit`** — Compiles `libzpaq` with `NOJIT` defined, disabling the JIT
+//!   x86 back-end.  Required on platforms without a functional x86 JIT (NetBSD,
+//!   OpenBSD).  Enabled automatically by the CI for those targets.
+//!
+//! # Quick start
+//!
+//! ```rust
+//! use zpaq_rs::{compress_to_vec, decompress_to_vec};
+//!
+//! let original = b"hello zpaq";
+//! let compressed = compress_to_vec(original, "1").unwrap();
+//! let restored   = decompress_to_vec(&compressed).unwrap();
+//! assert_eq!(restored, original);
+//! ```
+//!
+//! For large data or streaming use cases prefer [`compress_stream`] /
+//! [`decompress_stream`], which accept any [`std::io::Read`] / [`std::io::Write`].
+//!
+//! Use [`compress_size`] / [`compress_size_stream`] when you only need the
+//! compressed byte count and not the compressed data itself (avoids allocation).
+//!
+//! # Performance notes
+//!
+//! * Rust LTO applies within Rust crates; C++ LTO applies within the C++ object
+//!   files.  Cross-language inlining (Rust ↔ C++) is toolchain-dependent.
+//! * [`compress_size`] / [`compress_size_stream`] use a C++-side counting writer
+//!   to avoid per-byte FFI round-trips and are the fastest way to obtain $C(x)$
+//!   for information-theoretic metrics.
+//! * [`compress_size_parallel`] / [`compress_size_stream_parallel`] split the
+//!   input into ZPAQ blocks and compress them in parallel, which can be faster
+//!   on multi-core machines for large inputs.
 
 mod sys;
 
@@ -20,11 +67,22 @@ use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::slice;
 
+/// Convenience alias for `std::result::Result<T, ZpaqError>`.
 pub type Result<T> = std::result::Result<T, ZpaqError>;
 
+/// Errors returned by this crate.
 #[derive(Debug)]
 pub enum ZpaqError {
+    /// An error originating inside the C++ `libzpaq` / FFI shim.
+    ///
+    /// The inner string is the message reported by the C++ error channel.  It
+    /// may be empty (shown as `"unknown error"`) if libzpaq did not supply one.
     Ffi(String),
+    /// A method or path string contained an interior NUL byte (`\0`).
+    ///
+    /// ZPAQ method strings and file paths are passed to C++ as NUL-terminated
+    /// strings, so any input containing `\0` is rejected before crossing the FFI
+    /// boundary.
     NulInString,
 }
 
@@ -62,15 +120,30 @@ fn clear_last_error() {
     unsafe { sys::zpaq_clear_last_error() };
 }
 
-/// A `Write` implementation that discards data while counting bytes.
+/// A [`Write`] implementation that discards written bytes while counting them.
 ///
-/// Useful when you only care about compressed sizes (e.g. NCD/NED style metrics).
+/// Useful when you need the compressed (or decompressed) size without
+/// allocating a buffer.  For compressed-size measurements prefer the dedicated
+/// [`compress_size`] / [`compress_size_stream`] functions, which use a C++-side
+/// counting writer and avoid per-write FFI overhead entirely.
+///
+/// # Example
+///
+/// ```rust
+/// use std::io::Write;
+/// use zpaq_rs::CountingWriter;
+///
+/// let mut cw = CountingWriter::default();
+/// cw.write_all(b"hello").unwrap();
+/// assert_eq!(cw.bytes_written(), 5);
+/// ```
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CountingWriter {
     bytes: u64,
 }
 
 impl CountingWriter {
+    /// Returns the total number of bytes written so far.
     pub fn bytes_written(&self) -> u64 {
         self.bytes
     }
@@ -165,10 +238,36 @@ impl Read for StreamReader {
     }
 }
 
-/// Streaming ZPAQ compressor that exposes incremental encoded bit counts.
+/// Byte-at-a-time ZPAQ compressor that reports the running encoded bit count.
 ///
-/// Note: Streaming mode supports numeric levels 1..=3 and explicit method
-/// strings (x/s/i/0...) that do not use block preprocessing.
+/// Unlike the block-oriented [`compress_stream`], `StreamingCompressor` feeds
+/// one byte at a time to the underlying ZPAQ `Compressor` and queries the
+/// internal bit counter after each byte.  This is useful for measuring how many
+/// bits are required to encode each symbol incrementally — for example when
+/// computing per-symbol information content.
+///
+/// # Method string restrictions
+///
+/// Streaming mode only supports:
+/// * Numeric levels **1, 2, or 3** — levels 4 and 5 use block pre-processing
+///   that is incompatible with per-byte feeding.
+/// * Explicit method strings that start with `x`, `s`, `i`, or a digit and do
+///   **not** enable block pre-processing.
+///
+/// Attempting to create a compressor with level 4, 5, or a method that requires
+/// block preprocessing will return [`ZpaqError::Ffi`].
+///
+/// # Example
+///
+/// ```rust
+/// use zpaq_rs::StreamingCompressor;
+///
+/// let mut sc = StreamingCompressor::new("2").unwrap();
+/// for &b in b"hello" {
+///     sc.push(b).unwrap();
+/// }
+/// println!("bits so far: {:.2}", sc.bits());
+/// ```
 pub struct StreamingCompressor {
     compressor: *mut sys::Compressor,
     reader: *mut sys::RustReader,
@@ -180,6 +279,14 @@ pub struct StreamingCompressor {
 unsafe impl Send for StreamingCompressor {}
 
 impl StreamingCompressor {
+    /// Creates a new streaming compressor using the given method string.
+    ///
+    /// Allocates and initialises the underlying `libzpaq::Compressor`, sets up
+    /// internal reader/writer callbacks, writes the ZPAQ block tag, and opens
+    /// the first segment ready to receive bytes via [`push`](Self::push).
+    ///
+    /// Returns [`ZpaqError::Ffi`] if the method is unsupported in streaming mode
+    /// (e.g. numeric levels 4–5) or if any C++ initialisation step fails.
     pub fn new(method: &str) -> Result<Self> {
         let method_trim = method.trim();
         if method_trim.is_empty() {
@@ -309,6 +416,10 @@ impl StreamingCompressor {
         })
     }
 
+    /// Feeds one byte into the compressor and advances the internal state.
+    ///
+    /// Returns [`ZpaqError::Ffi`] if the underlying `libzpaq::Compressor::compress`
+    /// call fails (e.g. due to an I/O error in the underlying writer callback).
     pub fn push(&mut self, b: u8) -> Result<()> {
         unsafe {
             let ctx = &mut *self.reader_ctx;
@@ -321,6 +432,12 @@ impl StreamingCompressor {
         Ok(())
     }
 
+    /// Returns the number of bits written to the compressed output so far.
+    ///
+    /// This reflects the running total emitted by `libzpaq`'s internal bit
+    /// counter and accounts for both the block header and all bytes fed via
+    /// [`push`](Self::push).  The value is a `f64` because `libzpaq` tracks
+    /// fractional bits internally.
     pub fn bits(&self) -> f64 {
         unsafe { sys::zpaq_compressor_get_bits(self.compressor) }
     }
@@ -417,7 +534,18 @@ impl<W: Write + Send> Drop for FfiWriter<W> {
 
 // ---------------- Public API ----------------
 
-/// Compress all bytes from `input` into a Vec using the given method string (e.g. "1", "14", "x4.0ci1").
+/// Compresses `input` into a `Vec<u8>` using the given ZPAQ method string.
+///
+/// This is a convenience wrapper around [`compress_stream`] that owns both the
+/// input and output buffers.  For large data, prefer [`compress_stream`] to
+/// avoid double-buffering, or [`compress_size`] if you only need the size.
+///
+/// # Example
+///
+/// ```rust
+/// let compressed = zpaq_rs::compress_to_vec(b"hello zpaq", "1").unwrap();
+/// assert!(!compressed.is_empty());
+/// ```
 pub fn compress_to_vec(input: &[u8], method: &str) -> Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(input);
     let mut out = Vec::new();
@@ -425,24 +553,41 @@ pub fn compress_to_vec(input: &[u8], method: &str) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Compute the compressed size (in bytes) without materializing the compressed output.
+/// Returns the compressed size of `input` in bytes without materialising the
+/// compressed data.
 ///
-/// This is usually the fastest way to get $C(x)$ for information-theoretic distances.
+/// Uses a C++-side counting writer so no allocation is needed for the compressed
+/// bytes.  This is the fastest single-threaded way to compute $C(x)$ for
+/// information-theoretic metrics such as NCD.
+///
+/// # Example
+///
+/// ```rust
+/// let sz = zpaq_rs::compress_size(b"aaaaaaaaa", "1").unwrap();
+/// assert!(sz > 0);
+/// ```
 pub fn compress_size(input: &[u8], method: &str) -> Result<u64> {
     compress_size_stream(std::io::Cursor::new(input), method, None, None)
 }
 
-/// Compute the compressed size (in bytes) using multiple threads.
+/// Returns the compressed size of `input` in bytes using multiple threads.
 ///
-/// This splits the input into ZPAQ blocks (based on the method's block size) and
-/// compresses blocks in parallel using `libzpaq::compressBlock`.
+/// Splits the input into ZPAQ blocks (based on the method's block size) and
+/// compresses them in parallel using `libzpaq::compressBlock`.  For
+/// `threads <= 1` this falls back to the single-threaded path.
+///
+/// Equivalent to [`compress_size_stream_parallel`] with a [`std::io::Cursor`]
+/// over `input`.
 pub fn compress_size_parallel(input: &[u8], method: &str, threads: usize) -> Result<u64> {
     compress_size_stream_parallel(std::io::Cursor::new(input), method, None, None, threads)
 }
 
-/// Compute the compressed size (in bytes) without materializing the compressed output.
+/// Returns the compressed size of data from `reader` in bytes without
+/// materialising the compressed output.
 ///
-/// This uses a C++ counting writer to avoid Rust-side per-write overhead.
+/// Uses a C++-side counting writer to avoid Rust-side per-write overhead.
+/// `filename` and `comment` are optional ZPAQ segment metadata fields; pass
+/// `None` for both unless you are building interoperable archives.
 pub fn compress_size_stream<R: Read + Send>(
     reader: R,
     method: &str,
@@ -484,9 +629,11 @@ pub fn compress_size_stream<R: Read + Send>(
     }
 }
 
-/// Compute the compressed size (in bytes) using multiple threads.
+/// Returns the compressed size of data from `reader` in bytes using multiple
+/// threads.
 ///
-/// If `threads <= 1`, this falls back to the single-threaded path.
+/// Splits the input into ZPAQ blocks and compresses them in parallel.  Falls
+/// back to the single-threaded path when `threads <= 1`.
 pub fn compress_size_stream_parallel<R: Read + Send>(
     reader: R,
     method: &str,
@@ -530,13 +677,24 @@ pub fn compress_size_stream_parallel<R: Read + Send>(
     }
 }
 
-/// Compute the archive size (in bytes) that `zpaq add` would write for a single file.
+/// Returns the archive size (in bytes) that `zpaq add` would produce for a
+/// single file on disk.
 ///
-/// This runs the real `zpaq.cpp` JIDAC pipeline in-process (including fragment dedup),
-/// with `archive=""` so output is discarded but the size accounting is identical.
+/// Runs the real `zpaq.cpp` JIDAC pipeline in-process — including fragment
+/// deduplication and index overhead — with `archive=""` so output is discarded
+/// but the byte-count accounting is identical to a real archive write.
 ///
-/// This is the right metric to compare against:
-/// `zpaq add my.arc <file> ...` → `du -b my.arc`.
+/// This is the correct metric to compare against
+/// `zpaq add my.arc <file>; du -b my.arc`.
+///
+/// `path` must be a valid filesystem path to an existing file.  `threads`
+/// controls the number of parallel compression threads; `0` lets libzpaq
+/// choose.
+///
+/// # Errors
+///
+/// Returns [`ZpaqError::Ffi`] if the file cannot be opened or if the JIDAC
+/// pipeline encounters an error.
 pub fn zpaq_add_archive_size_file(path: &str, method: &str, threads: usize) -> Result<u64> {
     clear_last_error();
     let path_c = CString::new(path).map_err(|_| ZpaqError::NulInString)?;
@@ -557,7 +715,20 @@ pub fn zpaq_add_archive_size_file(path: &str, method: &str, threads: usize) -> R
     }
 }
 
-/// Decompress a full ZPAQ stream into memory.
+/// Decompresses a complete ZPAQ stream held in `input` and returns the
+/// original data as a `Vec<u8>`.
+///
+/// This is a convenience wrapper around [`decompress_stream`] that owns both
+/// the input and output.  For large data, prefer [`decompress_stream`] to
+/// avoid double-buffering.
+///
+/// # Example
+///
+/// ```rust
+/// let c = zpaq_rs::compress_to_vec(b"hello zpaq", "1").unwrap();
+/// let d = zpaq_rs::decompress_to_vec(&c).unwrap();
+/// assert_eq!(d, b"hello zpaq");
+/// ```
 pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>> {
     let cursor = std::io::Cursor::new(input);
     let mut out = Vec::new();
@@ -565,12 +736,19 @@ pub fn decompress_to_vec(input: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Compute the decompressed size (in bytes) without materializing output.
+/// Returns the decompressed size of the ZPAQ stream in `input` without
+/// materialising the output.
+///
+/// Wrapper around [`decompress_size_stream`] with a [`std::io::Cursor`].
 pub fn decompress_size(input: &[u8]) -> Result<u64> {
     decompress_size_stream(std::io::Cursor::new(input))
 }
 
-/// Compute the decompressed size (in bytes) without materializing output.
+/// Returns the decompressed size of the ZPAQ stream from `reader` without
+/// materialising output.
+///
+/// Uses a C++-side counting writer so no allocation is needed for the
+/// decompressed bytes.
 pub fn decompress_size_stream<R: Read + Send>(reader: R) -> Result<u64> {
     clear_last_error();
     let reader = FfiReader::new(reader)?;
@@ -583,7 +761,20 @@ pub fn decompress_size_stream<R: Read + Send>(reader: R) -> Result<u64> {
     }
 }
 
-/// Compress from any `Read` to any `Write`.
+/// Compresses data from `reader` and writes the ZPAQ archive to `writer`.
+///
+/// `method` is the ZPAQ method string (e.g. `"1"`, `"x4.3ci1"`).
+/// `filename` and `comment` are optional segment metadata; pass `None` for
+/// both in typical usage.
+///
+/// # Example
+///
+/// ```rust
+/// use std::io::Cursor;
+/// let mut out = Vec::new();
+/// zpaq_rs::compress_stream(Cursor::new(b"hello"), &mut out, "1", None, None).unwrap();
+/// assert!(!out.is_empty());
+/// ```
 pub fn compress_stream<R: Read + Send, W: Write + Send>(
     reader: R,
     writer: W,
@@ -628,7 +819,17 @@ pub fn compress_stream<R: Read + Send, W: Write + Send>(
     }
 }
 
-/// Decompress from any `Read` to any `Write`.
+/// Decompresses a ZPAQ archive from `reader` and writes raw data to `writer`.
+///
+/// # Example
+///
+/// ```rust
+/// use std::io::Cursor;
+/// let compressed = zpaq_rs::compress_to_vec(b"hello", "1").unwrap();
+/// let mut out = Vec::new();
+/// zpaq_rs::decompress_stream(Cursor::new(&compressed), &mut out).unwrap();
+/// assert_eq!(out, b"hello");
+/// ```
 pub fn decompress_stream<R: Read + Send, W: Write + Send>(reader: R, writer: W) -> Result<()> {
     clear_last_error();
     let reader = FfiReader::new(reader)?;
@@ -641,7 +842,12 @@ pub fn decompress_stream<R: Read + Send, W: Write + Send>(reader: R, writer: W) 
     }
 }
 
-/// Derive a 32-byte stretched key using scrypt (libzpaq defaults: N=16384, r=8, p=1).
+/// Derives a 32-byte key from `key32` and `salt32` using scrypt.
+///
+/// Uses libzpaq's fixed scrypt parameters: N = 16 384, r = 8, p = 1.
+/// Both input arrays must be exactly 32 bytes.
+///
+/// This is the same key-stretching used by `zpaq` encrypted archives.
 pub fn stretch_key(key32: [u8; 32], salt32: [u8; 32]) -> Result<[u8; 32]> {
     clear_last_error();
     let mut out = [0u8; 32];
@@ -653,7 +859,10 @@ pub fn stretch_key(key32: [u8; 32], salt32: [u8; 32]) -> Result<[u8; 32]> {
     }
 }
 
-/// Fill a buffer with cryptographically strong random bytes.
+/// Returns `len` cryptographically strong random bytes.
+///
+/// On Unix delegates to `/dev/urandom`; on Windows uses `CryptGenRandom`.
+/// Returns [`ZpaqError::Ffi`] if the platform RNG is unavailable.
 pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
     clear_last_error();
     let mut buf = vec![0u8; len];
@@ -665,7 +874,10 @@ pub fn random_bytes(len: usize) -> Result<Vec<u8>> {
     }
 }
 
-/// Minimal SHA-1 helper using the libzpaq implementation.
+/// Computes the SHA-1 digest of `bytes` using the libzpaq implementation.
+///
+/// Returns the 20-byte raw digest.  For new designs prefer [`sha256`];
+/// SHA-1 is exposed because it is used internally by ZPAQ segment checksums.
 pub fn sha1(bytes: &[u8]) -> Result<[u8; 20]> {
     clear_last_error();
     let s = unsafe { sys::zpaq_sha1_new() };
@@ -685,7 +897,9 @@ pub fn sha1(bytes: &[u8]) -> Result<[u8; 20]> {
     }
 }
 
-/// Minimal SHA-256 helper using the libzpaq implementation.
+/// Computes the SHA-256 digest of `bytes` using the libzpaq implementation.
+///
+/// Returns the 32-byte raw digest.
 pub fn sha256(bytes: &[u8]) -> Result<[u8; 32]> {
     clear_last_error();
     let s = unsafe { sys::zpaq_sha256_new() };
