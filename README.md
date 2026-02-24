@@ -61,6 +61,27 @@ let sz = zpaq_rs::compress_size(b"some data", "3")?;
 let sz = zpaq_rs::compress_size_parallel(b"some data", "3", 4)?;
 ```
 
+### Full ZPAQ archive operations (`add` / `list` / `extract`)
+
+The crate can run the real `zpaq.cpp` JIDAC engine in-process, providing full
+archive interoperability (multi-file archives, append updates, dedupe, list,
+extract, `-threads`, and other CLI options).
+
+```rust
+use zpaq_rs::{zpaq_add, zpaq_command, zpaq_list};
+
+// Equivalent to: zpaq add backup.zpaq ./data -method 3 -threads 4
+zpaq_add("backup.zpaq", &["./data"], "3", 4)?;
+
+// Equivalent to: zpaq list backup.zpaq
+let listing = zpaq_list("backup.zpaq", &[])?;
+println!("{}{}", listing.stdout, listing.stderr);
+
+// Any CLI-compatible command is available:
+// zpaq extract backup.zpaq -to ./restore
+zpaq_command(&["extract", "backup.zpaq", "-to", "./restore"])?;
+```
+
 ### Streaming compressor (per-byte bit counting)
 
 ```rust

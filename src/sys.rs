@@ -63,6 +63,13 @@ unsafe extern "C" {
     pub fn zpaq_last_error_len() -> usize;
     pub fn zpaq_last_error_copy(buf: *mut c_char, buf_len: usize) -> usize;
     pub fn zpaq_set_last_error(msg: *const c_char);
+    pub fn zpaq_last_stdout_ptr() -> *const c_char;
+    pub fn zpaq_last_stdout_len() -> usize;
+    pub fn zpaq_last_stdout_copy(buf: *mut c_char, buf_len: usize) -> usize;
+    pub fn zpaq_last_stderr_ptr() -> *const c_char;
+    pub fn zpaq_last_stderr_len() -> usize;
+    pub fn zpaq_last_stderr_copy(buf: *mut c_char, buf_len: usize) -> usize;
+    pub fn zpaq_clear_last_output();
 
     // Reader/Writer
     pub fn zpaq_reader_new(ctx: *mut c_void, get_cb: GetFn, read_cb: ReadFn) -> *mut RustReader;
@@ -108,6 +115,7 @@ unsafe extern "C" {
         threads: c_int,
         out_archive_size_bytes: *mut u64,
     ) -> c_int;
+    pub fn zpaq_jidac_run(argc: c_int, argv: *const *const c_char) -> c_int;
 
     // StringBuffer
     pub fn zpaq_string_buffer_new(initial: usize) -> *mut StringBuffer;

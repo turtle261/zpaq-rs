@@ -96,8 +96,15 @@ public:
 };
 
 thread_local std::string g_last_error;
+thread_local std::string g_last_stdout;
+thread_local std::string g_last_stderr;
 
 inline void clear_last_error() { g_last_error.clear(); }
+
+inline void clear_last_output() {
+  g_last_stdout.clear();
+  g_last_stderr.clear();
+}
 
 inline void set_last_error(const char* msg) {
   g_last_error.assign(msg ? msg : "(null)");
@@ -143,6 +150,32 @@ size_t zpaq_last_error_copy(char* buf, size_t buf_len) {
   if (copy_n) std::memcpy(buf, g_last_error.data(), copy_n);
   return copy_n;
 }
+
+const char* zpaq_last_stdout_ptr() { return g_last_stdout.empty() ? nullptr : g_last_stdout.c_str(); }
+
+size_t zpaq_last_stdout_len() { return g_last_stdout.size(); }
+
+size_t zpaq_last_stdout_copy(char* buf, size_t buf_len) {
+  if (!buf || buf_len == 0) return 0;
+  const size_t n = g_last_stdout.size();
+  const size_t copy_n = n < buf_len ? n : buf_len;
+  if (copy_n) std::memcpy(buf, g_last_stdout.data(), copy_n);
+  return copy_n;
+}
+
+const char* zpaq_last_stderr_ptr() { return g_last_stderr.empty() ? nullptr : g_last_stderr.c_str(); }
+
+size_t zpaq_last_stderr_len() { return g_last_stderr.size(); }
+
+size_t zpaq_last_stderr_copy(char* buf, size_t buf_len) {
+  if (!buf || buf_len == 0) return 0;
+  const size_t n = g_last_stderr.size();
+  const size_t copy_n = n < buf_len ? n : buf_len;
+  if (copy_n) std::memcpy(buf, g_last_stderr.data(), copy_n);
+  return copy_n;
+}
+
+void zpaq_clear_last_output() { clear_last_output(); }
 
 // ---------------- Reader/Writer callback shims ----------------
 
@@ -486,10 +519,46 @@ static bool parse_last_archive_mb(const char* s, size_t n, double* out_mb) {
   return false;
 }
 
-int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int threads, uint64_t* out_archive_size_bytes) {
+static bool read_stream_to_string(FILE* stream, std::string* out) {
+  if (!stream || !out) return false;
+  out->clear();
+  if (fseek(stream, 0, SEEK_END) != 0) return false;
+  long n = ftell(stream);
+  if (n < 0) return false;
+  if (n == 0) return true;
+  out->resize(static_cast<size_t>(n));
+  rewind(stream);
+  const size_t got = fread(&(*out)[0], 1, out->size(), stream);
+  out->resize(got);
+  return true;
+}
+
+static void set_error_from_stderr_fallback() {
+  if (!g_last_error.empty()) return;
+  if (g_last_stderr.empty()) {
+    set_last_error("zpaq command failed");
+    return;
+  }
+  const char* begin = g_last_stderr.c_str();
+  const char* end = begin + g_last_stderr.size();
+  while (begin < end && (*begin == '\n' || *begin == '\r' || *begin == ' ' || *begin == '\t')) ++begin;
+  const char* line_end = begin;
+  while (line_end < end && *line_end != '\n' && *line_end != '\r') ++line_end;
+  if (line_end > begin) {
+    set_last_error(std::string(begin, static_cast<size_t>(line_end - begin)).c_str());
+  } else {
+    set_last_error("zpaq command failed");
+  }
+}
+
+int zpaq_jidac_run(int argc, const char* const* argv) {
   clear_last_error();
+  clear_last_output();
   try {
-    if (!path || !*path || !method || !*method || !out_archive_size_bytes) return -1;
+    if (argc <= 0 || !argv) {
+      set_last_error("invalid argv");
+      return -1;
+    }
 
     static std::mutex g_mu;
     std::lock_guard<std::mutex> lock(g_mu);
@@ -497,8 +566,15 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
     fflush(stdout);
     fflush(stderr);
 
-    int old_stderr = dup(fileno(stderr));
-    int old_stdout = dup(fileno(stdout));
+    const int stderr_fd = fileno(stderr);
+    const int stdout_fd = fileno(stdout);
+    if (stderr_fd < 0 || stdout_fd < 0) {
+      set_last_error("fileno() failed");
+      return -1;
+    }
+
+    int old_stderr = dup(stderr_fd);
+    int old_stdout = dup(stdout_fd);
     if (old_stderr < 0 || old_stdout < 0) {
       if (old_stderr >= 0) close(old_stderr);
       if (old_stdout >= 0) close(old_stdout);
@@ -506,19 +582,18 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
       return -1;
     }
 
-    // Capture stderr; discard stdout.
-    // Note: open_memstream() has no file descriptor, so we use tmpfile().
     FILE* err_stream = tmpfile();
-    FILE* out_stream = fopen(DEV_NULL, "w");
+    FILE* out_stream = tmpfile();
     if (!err_stream || !out_stream) {
       if (err_stream) fclose(err_stream);
       if (out_stream) fclose(out_stream);
       close(old_stderr);
       close(old_stdout);
-      set_last_error("failed to redirect stdio");
+      set_last_error("failed to create capture streams");
       return -1;
     }
-    if (dup2(fileno(err_stream), fileno(stderr)) < 0 || dup2(fileno(out_stream), fileno(stdout)) < 0) {
+
+    if (dup2(fileno(err_stream), stderr_fd) < 0 || dup2(fileno(out_stream), stdout_fd) < 0) {
       fclose(err_stream);
       fclose(out_stream);
       close(old_stderr);
@@ -526,6 +601,53 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
       set_last_error("dup2() failed");
       return -1;
     }
+
+    int rc = 0;
+    try {
+      rc = zpaq_cli_main(argc, const_cast<const char**>(argv));
+    } catch (const std::exception& e) {
+      rc = 2;
+      set_last_error(e.what());
+    }
+
+    fflush(stdout);
+    fflush(stderr);
+
+    const bool out_ok = read_stream_to_string(out_stream, &g_last_stdout);
+    const bool err_ok = read_stream_to_string(err_stream, &g_last_stderr);
+
+    const int restore_err = dup2(old_stderr, stderr_fd);
+    const int restore_out = dup2(old_stdout, stdout_fd);
+
+    fclose(err_stream);
+    fclose(out_stream);
+    close(old_stderr);
+    close(old_stdout);
+
+    if (restore_err < 0 || restore_out < 0) {
+      set_last_error("failed to restore stdio");
+      return -1;
+    }
+    if (!out_ok || !err_ok) {
+      set_last_error("failed to read captured zpaq output");
+      return -1;
+    }
+
+    if (rc != 0) {
+      set_error_from_stderr_fallback();
+      return -1;
+    }
+    return 0;
+  } catch (const std::exception& e) {
+    set_last_error(e.what());
+    return -1;
+  }
+}
+
+int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int threads, uint64_t* out_archive_size_bytes) {
+  clear_last_error();
+  try {
+    if (!path || !*path || !method || !*method || !out_archive_size_bytes) return -1;
 
     // Build argv like: zpaq add "" <path> -method <method> -threads <N>
     std::string threads_s = std::to_string(threads);
@@ -539,40 +661,11 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
     argv[argc++] = method;
     argv[argc++] = "-threads";
     argv[argc++] = threads_s.c_str();
-    argv[argc++] = nullptr;
-
-    int rc = 0;
-    try {
-      rc = zpaq_cli_main(argc - 1, argv);
-    } catch (const std::exception& e) {
-      rc = 2;
-      set_last_error(e.what());
-    }
-
-    fflush(stdout);
-    fflush(stderr);
-
-    // Read captured stderr
-    std::string captured;
-    fseek(err_stream, 0, SEEK_END);
-    long n = ftell(err_stream);
-    if (n > 0) {
-      captured.resize((size_t)n);
-      rewind(err_stream);
-      const size_t got = fread(&captured[0], 1, captured.size(), err_stream);
-      captured.resize(got);
-    }
-    fclose(err_stream);
-    fclose(out_stream);
-
-    // Restore
-    dup2(old_stderr, fileno(stderr));
-    dup2(old_stdout, fileno(stdout));
-    close(old_stderr);
-    close(old_stdout);
+    const int rc = zpaq_jidac_run(argc, argv);
+    if (rc != 0) return -1;
 
     double archive_mb = 0.0;
-    const bool ok = parse_last_archive_mb(captured.data(), captured.size(), &archive_mb);
+    const bool ok = parse_last_archive_mb(g_last_stderr.data(), g_last_stderr.size(), &archive_mb);
     if (!ok) {
       set_last_error("failed to parse zpaq summary output");
       return -1;
@@ -581,7 +674,7 @@ int zpaq_jidac_add_archive_size_file(const char* path, const char* method, int t
     const double bytes_d = archive_mb * 1000000.0;
     const uint64_t bytes = bytes_d <= 0.0 ? 0ULL : (uint64_t)(bytes_d + 0.5);
     *out_archive_size_bytes = bytes;
-    return rc == 0 ? 0 : -1;
+    return 0;
   } catch (const std::exception& e) {
     set_last_error(e.what());
     return -1;

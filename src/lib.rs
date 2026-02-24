@@ -110,6 +110,32 @@ fn last_error_string() -> Option<String> {
     }
 }
 
+fn last_stdout_string() -> Option<String> {
+    unsafe {
+        let len = sys::zpaq_last_stdout_len();
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        let copied = sys::zpaq_last_stdout_copy(buf.as_mut_ptr() as *mut c_char, len);
+        buf.truncate(copied);
+        String::from_utf8(buf).ok()
+    }
+}
+
+fn last_stderr_string() -> Option<String> {
+    unsafe {
+        let len = sys::zpaq_last_stderr_len();
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len];
+        let copied = sys::zpaq_last_stderr_copy(buf.as_mut_ptr() as *mut c_char, len);
+        buf.truncate(copied);
+        String::from_utf8(buf).ok()
+    }
+}
+
 fn err_from_last() -> ZpaqError {
     last_error_string()
         .map(ZpaqError::Ffi)
@@ -118,6 +144,41 @@ fn err_from_last() -> ZpaqError {
 
 fn clear_last_error() {
     unsafe { sys::zpaq_clear_last_error() };
+}
+
+fn clear_last_output() {
+    unsafe { sys::zpaq_clear_last_output() };
+}
+
+/// Captured output of an embedded `zpaq` command.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZpaqCommandOutput {
+    /// Captured standard output from the command.
+    pub stdout: String,
+    /// Captured standard error from the command.
+    pub stderr: String,
+}
+
+fn zpaq_command_inner(args: &[String]) -> Result<ZpaqCommandOutput> {
+    clear_last_error();
+    clear_last_output();
+
+    let mut cargs = Vec::with_capacity(args.len() + 1);
+    cargs.push(CString::new("zpaq").map_err(|_| ZpaqError::NulInString)?);
+    for arg in args {
+        cargs.push(CString::new(arg.as_str()).map_err(|_| ZpaqError::NulInString)?);
+    }
+    let ptrs: Vec<*const c_char> = cargs.iter().map(|s| s.as_ptr()).collect();
+
+    let rc = unsafe { sys::zpaq_jidac_run(ptrs.len() as c_int, ptrs.as_ptr()) };
+    if rc != 0 {
+        return Err(err_from_last());
+    }
+
+    Ok(ZpaqCommandOutput {
+        stdout: last_stdout_string().unwrap_or_default(),
+        stderr: last_stderr_string().unwrap_or_default(),
+    })
 }
 
 /// A [`Write`] implementation that discards written bytes while counting them.
@@ -713,6 +774,74 @@ pub fn zpaq_add_archive_size_file(path: &str, method: &str, threads: usize) -> R
     } else {
         Err(err_from_last())
     }
+}
+
+/// Runs an embedded `zpaq` command in-process and captures its output.
+///
+/// `args` must contain only the command arguments, exactly as you would pass
+/// after `zpaq` on the shell.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// let out = zpaq_rs::zpaq_command(&["list", "archive.zpaq"])?;
+/// println!("{}", out.stdout);
+/// # Ok::<(), zpaq_rs::ZpaqError>(())
+/// ```
+pub fn zpaq_command(args: &[&str]) -> Result<ZpaqCommandOutput> {
+    let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+    zpaq_command_inner(&owned)
+}
+
+/// Equivalent of `zpaq add <archive> <inputs...> -method <method> -threads <threads>`.
+///
+/// This uses the real JIDAC engine from `zpaq.cpp`, so append semantics,
+/// deduplication, and archive metadata are fully interoperable with the `zpaq`
+/// binary.
+pub fn zpaq_add(
+    archive: &str,
+    inputs: &[&str],
+    method: &str,
+    threads: usize,
+) -> Result<ZpaqCommandOutput> {
+    if inputs.is_empty() {
+        return Err(ZpaqError::Ffi(
+            "zpaq add requires at least one input path".to_string(),
+        ));
+    }
+    let mut args = Vec::with_capacity(inputs.len() + 7);
+    args.push("add".to_string());
+    args.push(archive.to_string());
+    for input in inputs {
+        args.push((*input).to_string());
+    }
+    args.push("-method".to_string());
+    args.push(method.to_string());
+    args.push("-threads".to_string());
+    args.push(threads.to_string());
+    zpaq_command_inner(&args)
+}
+
+/// Equivalent of `zpaq extract <archive> [files...]`.
+pub fn zpaq_extract(archive: &str, files: &[&str]) -> Result<ZpaqCommandOutput> {
+    let mut args = Vec::with_capacity(files.len() + 2);
+    args.push("extract".to_string());
+    args.push(archive.to_string());
+    for file in files {
+        args.push((*file).to_string());
+    }
+    zpaq_command_inner(&args)
+}
+
+/// Equivalent of `zpaq list <archive> [files...]`.
+pub fn zpaq_list(archive: &str, files: &[&str]) -> Result<ZpaqCommandOutput> {
+    let mut args = Vec::with_capacity(files.len() + 2);
+    args.push("list".to_string());
+    args.push(archive.to_string());
+    for file in files {
+        args.push((*file).to_string());
+    }
+    zpaq_command_inner(&args)
 }
 
 /// Decompresses a complete ZPAQ stream held in `input` and returns the
