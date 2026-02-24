@@ -82,6 +82,31 @@ println!("{}{}", listing.stdout, listing.stderr);
 zpaq_command(&["extract", "backup.zpaq", "-to", "./restore"])?;
 ```
 
+### Byte-level archive entries 
+When you need to work directly with raw bytes (without staging temp input
+files), use the in-memory entry APIs:
+
+```rust
+use zpaq_rs::{ArchiveEntry, archive_append_entries_file, archive_from_entries, archive_read_file_bytes};
+
+let archive = archive_from_entries(
+    &[
+        ArchiveEntry { path: "a.txt", data: b"hello", comment: None },
+        ArchiveEntry { path: "b.bin", data: &[1, 2, 3], comment: None },
+    ],
+    "3",
+)?;
+
+let bytes = archive_read_file_bytes(&archive, "a.txt")?;
+assert_eq!(bytes, b"hello");
+
+archive_append_entries_file(
+    "my.zpaq",
+    &[ArchiveEntry { path: "a.txt", data: b"updated", comment: None }],
+    "3",
+)?;
+```
+
 ### Streaming compressor (per-byte bit counting)
 
 ```rust

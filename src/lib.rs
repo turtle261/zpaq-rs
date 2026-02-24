@@ -62,10 +62,12 @@ mod sys;
 
 use std::collections::VecDeque;
 use std::ffi::CString;
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 use std::slice;
+use std::sync::{Arc, Mutex};
 
 /// Convenience alias for `std::result::Result<T, ZpaqError>`.
 pub type Result<T> = std::result::Result<T, ZpaqError>;
@@ -591,6 +593,346 @@ impl<W: Write + Send> Drop for FfiWriter<W> {
             drop(Box::from_raw(self.ctx));
         }
     }
+}
+
+#[derive(Clone, Default)]
+struct SharedVecWriter {
+    inner: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedVecWriter {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn bytes(&self) -> Vec<u8> {
+        self.inner.lock().expect("poisoned writer buffer").clone()
+    }
+}
+
+impl Write for SharedVecWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.inner
+            .lock()
+            .map_err(|_| std::io::Error::other("poisoned writer buffer"))?
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct SinkWriter;
+
+impl Write for SinkWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn start_block_for_method(compressor: *mut sys::Compressor, method: &str) -> Result<()> {
+    let method_trim = method.trim();
+    if method_trim.is_empty() {
+        return Err(ZpaqError::Ffi("method string is empty".into()));
+    }
+    let rc = if let Ok(level) = method_trim.parse::<i32>() {
+        if !(1..=5).contains(&level) {
+            return Err(ZpaqError::Ffi(
+                "numeric method level must be in 1..=5".into(),
+            ));
+        }
+        unsafe { sys::zpaq_compressor_start_block_level(compressor, level) }
+    } else {
+        let method_c = CString::new(method_trim).map_err(|_| ZpaqError::NulInString)?;
+        unsafe { sys::zpaq_compressor_start_block_method(compressor, method_c.as_ptr()) }
+    };
+
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(err_from_last())
+    }
+}
+
+/// One in-archive file entry represented as raw bytes.
+#[derive(Debug, Clone, Copy)]
+pub struct ArchiveEntry<'a> {
+    /// File path to store in the archive.
+    pub path: &'a str,
+    /// File contents.
+    pub data: &'a [u8],
+    /// Optional per-segment comment.
+    pub comment: Option<&'a str>,
+}
+
+/// Creates a ZPAQ stream archive in memory from raw byte entries.
+///
+/// This performs no scratch-file I/O and writes each entry with its `path`
+/// stored as the segment filename.
+pub fn archive_from_entries(entries: &[ArchiveEntry<'_>], method: &str) -> Result<Vec<u8>> {
+    clear_last_error();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let compressor = unsafe { sys::zpaq_compressor_new() };
+    if compressor.is_null() {
+        return Err(err_from_last());
+    }
+
+    let out_shared = SharedVecWriter::new();
+    let out_writer = FfiWriter::new(out_shared.clone())?;
+
+    let set_out = unsafe { sys::zpaq_compressor_set_output(compressor, out_writer.raw) };
+    if set_out != 0 {
+        unsafe { sys::zpaq_compressor_free(compressor) };
+        return Err(err_from_last());
+    }
+
+    let rc_tag = unsafe { sys::zpaq_compressor_write_tag(compressor) };
+    if rc_tag != 0 {
+        unsafe { sys::zpaq_compressor_free(compressor) };
+        return Err(err_from_last());
+    }
+
+    start_block_for_method(compressor, method)?;
+
+    for entry in entries {
+        let filename_c = CString::new(entry.path).map_err(|_| ZpaqError::NulInString)?;
+        let comment_c = match entry.comment {
+            Some(text) => Some(CString::new(text).map_err(|_| ZpaqError::NulInString)?),
+            None => None,
+        };
+
+        let rc_seg = unsafe {
+            sys::zpaq_compressor_start_segment(
+                compressor,
+                filename_c.as_ptr(),
+                comment_c
+                    .as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(ptr::null()),
+            )
+        };
+        if rc_seg != 0 {
+            unsafe { sys::zpaq_compressor_free(compressor) };
+            return Err(err_from_last());
+        }
+
+        let input = FfiReader::new(std::io::Cursor::new(entry.data))?;
+        let rc_in = unsafe { sys::zpaq_compressor_set_input(compressor, input.raw) };
+        if rc_in != 0 {
+            unsafe { sys::zpaq_compressor_free(compressor) };
+            return Err(err_from_last());
+        }
+
+        loop {
+            let rc = unsafe { sys::zpaq_compressor_compress(compressor, 1 << 20) };
+            if rc < 0 {
+                unsafe { sys::zpaq_compressor_free(compressor) };
+                return Err(err_from_last());
+            }
+            if rc == 0 {
+                break;
+            }
+        }
+
+        let rc_end_seg = unsafe { sys::zpaq_compressor_end_segment(compressor, ptr::null()) };
+        if rc_end_seg != 0 {
+            unsafe { sys::zpaq_compressor_free(compressor) };
+            return Err(err_from_last());
+        }
+    }
+
+    let rc_end_block = unsafe { sys::zpaq_compressor_end_block(compressor) };
+    unsafe { sys::zpaq_compressor_free(compressor) };
+    if rc_end_block != 0 {
+        return Err(err_from_last());
+    }
+
+    drop(out_writer);
+    Ok(out_shared.bytes())
+}
+
+/// Appends raw byte entries to an archive file path without creating scratch files.
+pub fn archive_append_entries_file(
+    archive_path: &str,
+    entries: &[ArchiveEntry<'_>],
+    method: &str,
+) -> Result<()> {
+    let payload = archive_from_entries(entries, method)?;
+    if payload.is_empty() {
+        return Ok(());
+    }
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(archive_path)
+        .map_err(|e| ZpaqError::Ffi(format!("open archive for append failed: {e}")))?;
+    file.write_all(&payload)
+        .map_err(|e| ZpaqError::Ffi(format!("append archive write failed: {e}")))
+}
+
+/// Reads the newest segment whose stored filename matches `path` from an
+/// in-memory archive stream.
+fn archive_read_file_bytes_single_stream(archive: &[u8], path: &str) -> Result<Option<Vec<u8>>> {
+    clear_last_error();
+
+    let reader = FfiReader::new(std::io::Cursor::new(archive))?;
+    let decompresser = unsafe { sys::zpaq_decompresser_new() };
+    if decompresser.is_null() {
+        return Err(err_from_last());
+    }
+
+    let set_in = unsafe { sys::zpaq_decompresser_set_input(decompresser, reader.raw) };
+    if set_in != 0 {
+        unsafe { sys::zpaq_decompresser_free(decompresser) };
+        return Err(err_from_last());
+    }
+
+    let mut found: Option<Vec<u8>> = None;
+    let mut mem_out = 0.0f64;
+
+    loop {
+        let rc_block = unsafe { sys::zpaq_decompresser_find_block(decompresser, &mut mem_out) };
+        if rc_block < 0 {
+            unsafe { sys::zpaq_decompresser_free(decompresser) };
+            return Err(err_from_last());
+        }
+        if rc_block == 0 {
+            break;
+        }
+
+        loop {
+            let filename_shared = SharedVecWriter::new();
+            let filename_writer = FfiWriter::new(filename_shared.clone())?;
+            let rc_filename =
+                unsafe { sys::zpaq_decompresser_find_filename(decompresser, filename_writer.raw) };
+            if rc_filename < 0 {
+                unsafe { sys::zpaq_decompresser_free(decompresser) };
+                return Err(err_from_last());
+            }
+            if rc_filename == 0 {
+                break;
+            }
+            drop(filename_writer);
+
+            let comment_writer = FfiWriter::new(SinkWriter)?;
+            let rc_comment =
+                unsafe { sys::zpaq_decompresser_read_comment(decompresser, comment_writer.raw) };
+            if rc_comment != 0 {
+                unsafe { sys::zpaq_decompresser_free(decompresser) };
+                return Err(err_from_last());
+            }
+            drop(comment_writer);
+
+            let mut filename_bytes = filename_shared.bytes();
+            while filename_bytes.last().copied() == Some(0) {
+                filename_bytes.pop();
+            }
+            let filename = String::from_utf8_lossy(&filename_bytes);
+            let is_target = filename == path;
+
+            let output_shared = SharedVecWriter::new();
+            let output_sink: Box<dyn Write + Send> = if is_target {
+                Box::new(output_shared.clone())
+            } else {
+                Box::new(SinkWriter)
+            };
+            let output_writer = FfiWriter::new(output_sink)?;
+
+            let rc_set_out =
+                unsafe { sys::zpaq_decompresser_set_output(decompresser, output_writer.raw) };
+            if rc_set_out != 0 {
+                unsafe { sys::zpaq_decompresser_free(decompresser) };
+                return Err(err_from_last());
+            }
+
+            loop {
+                let rc_decompress =
+                    unsafe { sys::zpaq_decompresser_decompress(decompresser, 1 << 20) };
+                if rc_decompress < 0 {
+                    unsafe { sys::zpaq_decompresser_free(decompresser) };
+                    return Err(err_from_last());
+                }
+                if rc_decompress == 0 {
+                    break;
+                }
+            }
+
+            let mut segment_end = [0u8; 21];
+            let rc_end = unsafe {
+                sys::zpaq_decompresser_read_segment_end(decompresser, segment_end.as_mut_ptr())
+            };
+            if rc_end != 0 {
+                unsafe { sys::zpaq_decompresser_free(decompresser) };
+                return Err(err_from_last());
+            }
+
+            drop(output_writer);
+
+            if is_target {
+                found = Some(output_shared.bytes());
+            }
+        }
+    }
+
+    unsafe { sys::zpaq_decompresser_free(decompresser) };
+    Ok(found)
+}
+
+/// Reads the newest segment whose stored filename matches `path` from an
+/// archive byte slice.
+///
+/// Supports concatenated ZPAQ streams (e.g. repeated append operations).
+pub fn archive_read_file_bytes(archive: &[u8], path: &str) -> Result<Vec<u8>> {
+    const ZPAQ_TAG: [u8; 13] = [
+        0x37, 0x6b, 0x53, 0x74, 0xa0, 0x31, 0x83, 0xd3, 0x8c, 0xb2, 0x28, 0xb0, 0xd3,
+    ];
+
+    if archive.is_empty() {
+        return Err(ZpaqError::Ffi("archive is empty".into()));
+    }
+
+    let mut starts = Vec::new();
+    for index in 0..=archive.len().saturating_sub(ZPAQ_TAG.len()) {
+        if archive[index..].starts_with(&ZPAQ_TAG) {
+            starts.push(index);
+        }
+    }
+    if starts.is_empty() {
+        return Err(ZpaqError::Ffi("no ZPAQ stream header found".into()));
+    }
+
+    let mut latest = None;
+    for (position, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(position + 1).copied().unwrap_or(archive.len());
+        if end <= start {
+            continue;
+        }
+        if let Some(bytes) = archive_read_file_bytes_single_stream(&archive[start..end], path)? {
+            latest = Some(bytes);
+        }
+    }
+
+    latest.ok_or_else(|| ZpaqError::Ffi(format!("file path not found in archive: {path}")))
+}
+
+/// Reads bytes for `path` from an archive file.
+pub fn archive_read_file_bytes_from_file(archive_path: &str, path: &str) -> Result<Vec<u8>> {
+    let archive = std::fs::read(archive_path)
+        .map_err(|e| ZpaqError::Ffi(format!("read archive file failed: {e}")))?;
+    archive_read_file_bytes(&archive, path)
 }
 
 // ---------------- Public API ----------------

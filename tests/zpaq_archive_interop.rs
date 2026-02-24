@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use zpaq_rs::{zpaq_add, zpaq_command, zpaq_list};
+use zpaq_rs::{
+    ArchiveEntry, archive_append_entries_file, archive_from_entries, archive_read_file_bytes,
+    zpaq_add, zpaq_command, zpaq_list,
+};
 
 fn unique_temp_dir(prefix: &str) -> PathBuf {
     let nanos = SystemTime::now()
@@ -38,9 +41,13 @@ where
 
 fn ensure_zpaq_cli(root: &Path) -> PathBuf {
     let zpaq_dir = root.join("zpaq");
-    let output = Command::new("make")
-        .current_dir(&zpaq_dir)
-        .arg("zpaq")
+    let mut cmd = Command::new("make");
+    cmd.current_dir(&zpaq_dir).arg("zpaq");
+    // Allow disabling the JIT via environment when running in CI.
+    if std::env::var("ZPAQ_NOJIT").is_ok() {
+        cmd.env("CPPFLAGS", "-Dunix -DNOJIT");
+    }
+    let output = cmd
         .output()
         .expect("run make zpaq");
     assert!(
@@ -194,6 +201,68 @@ fn archive_add_append_list_extract_interop_matches_cli() {
             "cli extracted file contents differ for {name}"
         );
     }
+
+    // Byte-entry APIs: write/read files in archive without scratch staging.
+    let bytes_archive = temp.join("bytes-api.zpaq");
+    let bytes_archive_s = bytes_archive.to_string_lossy().to_string();
+    let blob = archive_from_entries(
+        &[
+            ArchiveEntry {
+                path: "virtual/one.txt",
+                data: b"entry one",
+                comment: None,
+            },
+            ArchiveEntry {
+                path: "virtual/two.bin",
+                data: b"\x01\x02\x03\x04",
+                comment: None,
+            },
+        ],
+        "3",
+    )
+    .expect("build in-memory bytes archive");
+    fs::write(&bytes_archive, &blob).expect("persist bytes archive");
+
+    archive_append_entries_file(
+        &bytes_archive_s,
+        &[ArchiveEntry {
+            path: "virtual/one.txt",
+            data: b"entry one updated",
+            comment: None,
+        }],
+        "3",
+    )
+    .expect("append bytes archive entry");
+
+    let newest = archive_read_file_bytes(
+        &fs::read(&bytes_archive).expect("read bytes archive back"),
+        "virtual/one.txt",
+    )
+    .expect("read newest bytes entry");
+    assert_eq!(newest, b"entry one updated");
+
+    let bytes_extract_dir = temp.join("extract_bytes_cli");
+    fs::create_dir_all(&bytes_extract_dir).expect("create bytes extract dir");
+    run_ok(
+        &zpaq_bin,
+        [
+            OsStr::new("extract"),
+            OsStr::new(&bytes_archive_s),
+            OsStr::new("-to"),
+            bytes_extract_dir.as_os_str(),
+        ],
+    );
+
+    let one_path = find_file_named(&bytes_extract_dir, "one.txt").expect("find one.txt");
+    let two_path = find_file_named(&bytes_extract_dir, "two.bin").expect("find two.bin");
+    assert_eq!(
+        fs::read(one_path).expect("read extracted one"),
+        b"entry one updated"
+    );
+    assert_eq!(
+        fs::read(two_path).expect("read extracted two"),
+        b"\x01\x02\x03\x04"
+    );
 
     let _ = fs::remove_dir_all(temp);
 }

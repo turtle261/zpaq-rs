@@ -168,6 +168,9 @@ jobs:
     name: macOS arm64
     needs: lint
     runs-on: macos-15
+    env:
+      ZPAQ_NOJIT: 1
+      CARGO_FEATURE_NOJIT: 1
     steps:
       - uses: actions/checkout@v4
 
@@ -289,6 +292,7 @@ jobs:
               NetBSD)
                 # JIT codegen is broken on NetBSD; disable it
                 export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 # C++ LTO on NetBSD drops symbols from archives; build.rs
                 # already gates -flto on target_os != "netbsd", but also
                 # disable Rust-side LTO to be safe
@@ -301,6 +305,7 @@ jobs:
               OpenBSD)
                 # JIT codegen is broken on OpenBSD
                 export CARGO_FEATURE_NOJIT=1
+                export ZPAQ_NOJIT=1
                 ;;
               FreeBSD)
                 # No special flags needed
