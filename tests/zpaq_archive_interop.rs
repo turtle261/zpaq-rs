@@ -47,9 +47,7 @@ fn ensure_zpaq_cli(root: &Path) -> PathBuf {
     if std::env::var("ZPAQ_NOJIT").is_ok() {
         cmd.env("CPPFLAGS", "-Dunix -DNOJIT");
     }
-    let output = cmd
-        .output()
-        .expect("run make zpaq");
+    let output = cmd.output().expect("run make zpaq");
     assert!(
         output.status.success(),
         "make zpaq failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
