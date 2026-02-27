@@ -1,6 +1,6 @@
 [package]
 name = "zpaq_rs"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2024"
 license = "CC0-1.0"
 description = "Safe Rust bindings for libzpaq — ZPAQ compression, decompression, streaming compression, and crypto utilities (SHA-1, SHA-256, AES-CTR, scrypt)."

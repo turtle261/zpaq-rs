@@ -1,6 +1,43 @@
 use std::env;
 use std::process::Command;
 
+fn rustflags_request_native() -> bool {
+    fn iter_flags(var: &str) -> Vec<String> {
+        env::var(var)
+            .ok()
+            .map(|v| {
+                if var == "CARGO_ENCODED_RUSTFLAGS" {
+                    v.split('\x1f')
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .collect()
+                } else {
+                    v.split_whitespace().map(|s| s.to_string()).collect()
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    let mut flags = iter_flags("CARGO_ENCODED_RUSTFLAGS");
+    flags.extend(iter_flags("RUSTFLAGS"));
+
+    for (i, flag) in flags.iter().enumerate() {
+        if flag == "-Ctarget-cpu=native" {
+            return true;
+        }
+
+        if flag == "-C" {
+            if let Some(next) = flags.get(i + 1) {
+                if next == "target-cpu=native" {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn exe_exists(name: &str) -> bool {
     #[cfg(unix)]
     {
@@ -59,7 +96,6 @@ fn main() {
         .flag_if_supported("-fvisibility=hidden")
         .flag_if_supported("-fPIC")
         .flag_if_supported("-pthread")
-        .flag_if_supported("-march=native")
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-null-pointer-subtraction")
         .flag_if_supported("-Wno-unused-const-variable")
@@ -80,6 +116,19 @@ fn main() {
 
     // Always optimize zpaq
     build.flag_if_supported("-O3");
+
+    // Keep C++ codegen aligned with Rust when native tuning is explicitly requested.
+    if rustflags_request_native() {
+        match target_arch.as_str() {
+            "x86" | "x86_64" => {
+                build.flag_if_supported("-march=native");
+            }
+            "arm" | "aarch64" => {
+                build.flag_if_supported("-mcpu=native");
+            }
+            _ => {}
+        }
+    }
 
     // Try to enable LTO for the C++ objects in release-like profiles.
     // Cross-language LTO (Rust <-> C++) is toolchain-dependent; this at least
