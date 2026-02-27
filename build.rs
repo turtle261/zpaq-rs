@@ -26,7 +26,10 @@ fn rustflags_request_native() -> bool {
             return true;
         }
 
-        if flag == "-C" && let Some(next) = flags.get(i + 1) && next == "target-cpu=native" {
+        if flag == "-C"
+            && let Some(next) = flags.get(i + 1)
+            && next == "target-cpu=native"
+        {
             return true;
         }
     }
