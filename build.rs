@@ -2,6 +2,25 @@ use std::env;
 use std::process::Command;
 
 fn rustflags_request_native() -> bool {
+    let flags = rustflags();
+
+    for (i, flag) in flags.iter().enumerate() {
+        if flag == "-Ctarget-cpu=native" {
+            return true;
+        }
+
+        if flag == "-C"
+            && let Some(next) = flags.get(i + 1)
+            && next == "target-cpu=native"
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn rustflags() -> Vec<String> {
     fn iter_flags(var: &str) -> Vec<String> {
         env::var(var)
             .ok()
@@ -20,20 +39,22 @@ fn rustflags_request_native() -> bool {
 
     let mut flags = iter_flags("CARGO_ENCODED_RUSTFLAGS");
     flags.extend(iter_flags("RUSTFLAGS"));
+    flags
+}
 
+fn rustflags_request_pgo() -> bool {
+    let flags = rustflags();
     for (i, flag) in flags.iter().enumerate() {
-        if flag == "-Ctarget-cpu=native" {
+        if flag.starts_with("-Cprofile-generate=") || flag.starts_with("-Cprofile-use=") {
             return true;
         }
-
         if flag == "-C"
             && let Some(next) = flags.get(i + 1)
-            && next == "target-cpu=native"
+            && (next.starts_with("profile-generate=") || next.starts_with("profile-use="))
         {
             return true;
         }
     }
-
     false
 }
 
@@ -142,6 +163,7 @@ fn main() {
     if (profile == "release" || profile == "bench")
         && target_os != "windows"
         && target_os != "netbsd"
+        && !rustflags_request_pgo()
     {
         build.flag_if_supported("-flto");
     }
