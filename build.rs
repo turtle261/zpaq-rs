@@ -84,10 +84,15 @@ fn exe_exists(name: &str) -> bool {
     }
 }
 
+fn building_python_extension() -> bool {
+    env::var_os("PYO3_BUILD_EXTENSION_MODULE").is_some()
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=zpaq/libzpaq.cpp");
     println!("cargo:rerun-if-changed=zpaq/libzpaq.h");
     println!("cargo:rerun-if-changed=zpaq_rs_ffi.cpp");
+    println!("cargo:rerun-if-env-changed=PYO3_BUILD_EXTENSION_MODULE");
 
     let mut build = cc::Build::new();
 
@@ -159,10 +164,13 @@ fn main() {
     // - On NetBSD, archive/link toolchains commonly miss the LTO plugin for
     //   C++ objects, which can drop symbols from libzpaq_rs_ffi.a. Disable
     //   C++-side LTO there to preserve reliable linking.
+    // - Python extension builds often link with the platform linker rather
+    //   than lld, so C++ LLVM bitcode objects are a portability hazard there.
     let profile = env::var("PROFILE").unwrap_or_default();
     if (profile == "release" || profile == "bench")
         && target_os != "windows"
         && target_os != "netbsd"
+        && !building_python_extension()
         && !rustflags_request_pgo()
     {
         build.flag_if_supported("-flto");
