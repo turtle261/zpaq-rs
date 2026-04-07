@@ -41,11 +41,34 @@ where
 
 fn ensure_zpaq_cli(root: &Path) -> PathBuf {
     let zpaq_dir = root.join("zpaq");
+    let clean_output = Command::new("make")
+        .current_dir(&zpaq_dir)
+        .arg("clean")
+        .output()
+        .expect("run make clean");
+    assert!(
+        clean_output.status.success(),
+        "make clean failed: status={:?}\nstdout:\n{}\nstderr:\n{}",
+        clean_output.status,
+        String::from_utf8_lossy(&clean_output.stdout),
+        String::from_utf8_lossy(&clean_output.stderr)
+    );
+
+    // Keep the standalone CLI build aligned with the crate build:
+    // libzpaq JIT is x86_64-specific, and some CI jobs force NOJIT via env.
+    let force_nojit = std::env::var("ZPAQ_NOJIT").is_ok()
+        || std::env::var("CARGO_FEATURE_NOJIT").is_ok()
+        || cfg!(feature = "nojit")
+        || !cfg!(target_arch = "x86_64");
+
     let mut cmd = Command::new("make");
-    cmd.current_dir(&zpaq_dir).arg("zpaq");
-    // Allow disabling the JIT via environment when running in CI.
-    if std::env::var("ZPAQ_NOJIT").is_ok() {
-        cmd.env("CPPFLAGS", "-Dunix -DNOJIT");
+    cmd.current_dir(&zpaq_dir);
+    if force_nojit {
+        // Use a command-line make variable assignment so the Makefile's own
+        // `CPPFLAGS += ...` cannot accidentally drop NOJIT.
+        cmd.args(["CPPFLAGS=-Dunix -DNOJIT", "zpaq"]);
+    } else {
+        cmd.arg("zpaq");
     }
     let output = cmd.output().expect("run make zpaq");
     assert!(
